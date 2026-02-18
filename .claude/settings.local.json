@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(cat:*)",
+      "Bash(plutil:*)",
+      "Bash(xattr:*)",
+      "Bash(defaults read:*)",
+      "Bash(/System/Library/CoreServices/pbs -flush)",
+      "Bash(killall:*)",
+      "Bash(pluginkit -e use:*)",
+      "Bash(/System/Library/CoreServices/pbs:*)",
+      "Bash(log show:*)",
+      "Bash(pluginkit:*)",
+      "Bash(mdfind:*)",
+      "Bash(pbs:*)",
+      "Bash(/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister:*)",
+      "Bash(automator:*)",
+      "Bash(xcodebuild:*)",
+      "Bash(open:*)",
+      "Bash(echo:*)"
+    ]
+  }
+}
