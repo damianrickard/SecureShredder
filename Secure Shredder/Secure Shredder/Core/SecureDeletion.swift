@@ -11,11 +11,11 @@ import Foundation
 class SecureDeletion {
     private let fileManager = FileManager.default
 
-    /// Securely delete a file (bypassing Trash)
+    /// Securely delete a file (bypassing Trash).
+    /// Strips extended attributes and resource forks before removal to reduce metadata leakage.
     /// - Parameter url: URL of file to delete
     /// - Throws: ShredError if deletion fails
     func deleteFile(at url: URL) throws {
-        // Request access to security-scoped resource (required for sandboxed apps)
         let hasAccess = url.startAccessingSecurityScopedResource()
         defer {
             if hasAccess {
@@ -25,6 +25,9 @@ class SecureDeletion {
 
         // Unlock file if needed (remove immutable flag)
         try unlockFile(at: url)
+
+        // Strip extended attributes before deletion
+        removeExtendedAttributes(at: url)
 
         // Delete file directly (bypasses Trash when done programmatically)
         do {
@@ -38,7 +41,6 @@ class SecureDeletion {
     /// - Parameter url: URL of directory to delete
     /// - Throws: ShredError if deletion fails
     func deleteDirectory(at url: URL) throws {
-        // Request access to security-scoped resource (required for sandboxed apps)
         let hasAccess = url.startAccessingSecurityScopedResource()
         defer {
             if hasAccess {
@@ -59,14 +61,11 @@ class SecureDeletion {
     private func unlockFile(at url: URL) throws {
         let path = url.path
 
-        // Use chflags to clear both user and system immutable flags
-        // This is more reliable than FileManager.setAttributes which only handles user flags
         var attrs = stat()
         guard stat(path, &attrs) == 0 else {
             return  // Can't stat file, proceed anyway
         }
 
-        // Check if any immutable flags are set
         let hasUserImmutable = attrs.st_flags & UInt32(UF_IMMUTABLE) != 0
         let hasSystemImmutable = attrs.st_flags & UInt32(SF_IMMUTABLE) != 0
 
@@ -78,6 +77,36 @@ class SecureDeletion {
             // Attempt to clear flags - ignore errors as we may not have permission
             // for system flags, but user flags should work
             _ = chflags(path, newFlags)
+        }
+    }
+
+    /// Remove all extended attributes from a file.
+    /// On macOS, extended attributes (xattrs) and resource forks can contain
+    /// sensitive metadata such as where a file was downloaded from, Spotlight
+    /// comments, and custom tags. Stripping them before deletion prevents
+    /// metadata leakage even if the file's data blocks are recovered.
+    private func removeExtendedAttributes(at url: URL) {
+        let path = url.path
+
+        // listxattr returns the total buffer size needed for all attribute names
+        let size = listxattr(path, nil, 0, XATTR_NOFOLLOW)
+        guard size > 0 else { return }
+
+        // Allocate buffer and list all attribute names
+        var buffer = [CChar](repeating: 0, count: size)
+        let actualSize = listxattr(path, &buffer, size, XATTR_NOFOLLOW)
+        guard actualSize > 0 else { return }
+
+        // Parse null-terminated attribute names and remove each one
+        var offset = 0
+        while offset < actualSize {
+            let name = String(cString: &buffer[offset])
+            guard !name.isEmpty else { break }
+
+            // removexattr: remove the attribute; ignore errors (may lack permission)
+            _ = removexattr(path, name, XATTR_NOFOLLOW)
+
+            offset += name.utf8.count + 1  // +1 for null terminator
         }
     }
 

@@ -8,7 +8,8 @@
 import Foundation
 import Combine
 
-/// Main engine for orchestrating secure file shredding
+/// Main engine for orchestrating secure file shredding.
+/// Progress updates are dispatched to @MainActor; heavy I/O runs on a background executor.
 @MainActor
 class ShredEngine: ObservableObject {
     private let cryptoShredder = CryptoShredder()
@@ -63,12 +64,16 @@ class ShredEngine: ObservableObject {
                 filesFailed: 0,
                 bytesShredded: 0,
                 fileResults: [],
+                hardLinkedFiles: [],
                 wasCancelled: false,
                 duration: Date().timeIntervalSince(startTime)
             )
         }
 
         operation.totalFiles = discoveredFiles.count
+
+        // Detect hard-linked files and record them for user warnings
+        let hardLinkedFiles = discoveredFiles.filter { $0.isHardLinked }
 
         // Compute per-file erase strategies
         let strategies: [URL: EraseStrategy] = Dictionary(
@@ -93,6 +98,7 @@ class ShredEngine: ObservableObject {
                     filesFailed: filesFailed,
                     bytesShredded: bytesShredded,
                     fileResults: fileResults,
+                    hardLinkedFiles: hardLinkedFiles.map { $0.url },
                     wasCancelled: true,
                     duration: Date().timeIntervalSince(startTime)
                 )
@@ -101,12 +107,12 @@ class ShredEngine: ObservableObject {
             operation.currentFileIndex = index
             operation.currentFile = file.url.lastPathComponent
 
-            let strategy = strategies[file.url] ?? .overwrite
+            let fileStrategy = strategies[file.url] ?? .overwrite
 
-            // Process the file with the appropriate strategy
-            let fileResult = await processSingleFile(
+            // Run the heavy I/O work on a background thread
+            let fileResult = await runShredOnBackground(
                 file: file,
-                strategy: strategy,
+                strategy: fileStrategy,
                 configuration: configuration,
                 fileIndex: index,
                 totalFiles: discoveredFiles.count,
@@ -145,6 +151,7 @@ class ShredEngine: ObservableObject {
             filesFailed: filesFailed,
             bytesShredded: bytesShredded,
             fileResults: fileResults,
+            hardLinkedFiles: hardLinkedFiles.map { $0.url },
             wasCancelled: false,
             duration: Date().timeIntervalSince(startTime)
         )
@@ -165,7 +172,8 @@ class ShredEngine: ObservableObject {
         }
     }
 
-    private func processSingleFile(
+    /// Dispatch heavy shredding I/O to a background thread, reporting progress back on MainActor.
+    private func runShredOnBackground(
         file: FileDiscovery.DiscoveredFile,
         strategy: EraseStrategy,
         configuration: ShredConfiguration,
@@ -173,98 +181,62 @@ class ShredEngine: ObservableObject {
         totalFiles: Int,
         operation: ShredOperation
     ) async -> ShredResult.FileResult {
-        let startBytes = file.size
+        // Capture values needed on the background thread
+        let url = file.url
+        let size = file.size
+        let chunkSize = configuration.chunkSize
+        let passes = configuration.overwritePasses
+        let verify = configuration.verifyAfterWrite
+
+        // The progress callback bridges background work → MainActor
+        let progressCallback: (Double, String) -> Void = { progress, status in
+            Task { @MainActor in
+                if !status.isEmpty {
+                    operation.statusMessage = status
+                }
+                let fileWeight = 1.0 / Double(totalFiles)
+                let fileProgress = Double(fileIndex) * fileWeight
+                let currentFileProgress = progress * fileWeight
+                operation.progress = fileProgress + currentFileProgress
+            }
+        }
 
         switch strategy {
         case .crypto:
             do {
                 try await cryptoShredder.shredFile(
-                    at: file.url,
-                    chunkSize: configuration.chunkSize,
-                    verify: configuration.verifyAfterWrite
-                ) { progress, status in
-                    Task { @MainActor in
-                        if !status.isEmpty {
-                            operation.statusMessage = status
-                        }
-
-                        let fileWeight = 1.0 / Double(totalFiles)
-                        let fileProgress = Double(fileIndex) * fileWeight
-                        let currentFileProgress = progress * fileWeight
-                        operation.progress = fileProgress + currentFileProgress
-                    }
-                }
-
-                try secureDeletion.deleteFile(at: file.url)
-
-                return ShredResult.FileResult(
-                    url: file.url,
-                    success: true,
-                    error: nil,
-                    bytesWritten: startBytes
+                    at: url,
+                    chunkSize: chunkSize,
+                    verify: verify,
+                    progress: progressCallback
                 )
+                try secureDeletion.deleteFile(at: url)
+                return ShredResult.FileResult(url: url, success: true, error: nil, bytesWritten: size)
             } catch {
-                return ShredResult.FileResult(
-                    url: file.url,
-                    success: false,
-                    error: error,
-                    bytesWritten: 0
-                )
+                return ShredResult.FileResult(url: url, success: false, error: error, bytesWritten: 0)
             }
 
         case .overwrite:
             do {
                 try await overwriteShredder.overwriteFile(
-                    at: file.url,
-                    passes: configuration.overwritePasses,
-                    chunkSize: configuration.chunkSize,
-                    verify: configuration.verifyAfterWrite
-                ) { progress, status in
-                    Task { @MainActor in
-                        if !status.isEmpty {
-                            operation.statusMessage = status
-                        }
-
-                        let fileWeight = 1.0 / Double(totalFiles)
-                        let fileProgress = Double(fileIndex) * fileWeight
-                        let currentFileProgress = progress * fileWeight
-                        operation.progress = fileProgress + currentFileProgress
-                    }
-                }
-
-                try secureDeletion.deleteFile(at: file.url)
-
-                return ShredResult.FileResult(
-                    url: file.url,
-                    success: true,
-                    error: nil,
-                    bytesWritten: startBytes
+                    at: url,
+                    passes: passes,
+                    chunkSize: chunkSize,
+                    verify: verify,
+                    progress: progressCallback
                 )
+                try secureDeletion.deleteFile(at: url)
+                return ShredResult.FileResult(url: url, success: true, error: nil, bytesWritten: size)
             } catch {
-                return ShredResult.FileResult(
-                    url: file.url,
-                    success: false,
-                    error: error,
-                    bytesWritten: 0
-                )
+                return ShredResult.FileResult(url: url, success: false, error: error, bytesWritten: 0)
             }
 
         case .unlinkOnlyNetwork:
             do {
-                try FileManager.default.removeItem(at: file.url)
-                return ShredResult.FileResult(
-                    url: file.url,
-                    success: true,
-                    error: nil,
-                    bytesWritten: 0
-                )
+                try FileManager.default.removeItem(at: url)
+                return ShredResult.FileResult(url: url, success: true, error: nil, bytesWritten: 0)
             } catch {
-                return ShredResult.FileResult(
-                    url: file.url,
-                    success: false,
-                    error: error,
-                    bytesWritten: 0
-                )
+                return ShredResult.FileResult(url: url, success: false, error: error, bytesWritten: 0)
             }
         }
     }

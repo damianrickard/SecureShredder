@@ -19,6 +19,7 @@
 
 import Foundation
 import Security
+import CryptoKit
 
 /// DoD 5220.22-M pass pattern
 enum DoDPattern {
@@ -133,8 +134,10 @@ final class OverwriteShredder {
         let bufSize = max(4096, chunkSize)
         var buffer = [UInt8](repeating: 0, count: bufSize)
 
-        // Track last pattern for verification
+        // For random-pass verification, we compute a SHA-256 hash of what we wrote
+        // then read it back and compare hashes chunk-by-chunk.
         var lastPattern: DoDPattern = .random
+        var writtenRandomHash: SHA256Digest?
 
         for (passIndex, pattern) in patterns.enumerated() {
             lastPattern = pattern
@@ -157,6 +160,11 @@ final class OverwriteShredder {
 
             var remaining = fileSize
 
+            // For the last pass, if random, compute a running hash of what we write
+            let isLastPass = passIndex == totalPatterns - 1
+            let trackHash = isLastPass && pattern == .random && verify
+            var hasher: SHA256? = trackHash ? SHA256() : nil
+
             while remaining > 0 {
                 // Check cancellation within chunk loop
                 if Task.isCancelled {
@@ -168,6 +176,15 @@ final class OverwriteShredder {
 
                 // Fill buffer with the appropriate pattern
                 try fillBuffer(&buffer, count: toWrite, pattern: pattern)
+
+                // If tracking, feed written bytes into hash
+                if trackHash {
+                    buffer.withUnsafeBufferPointer { ptr in
+                        hasher!.update(bufferPointer: UnsafeRawBufferPointer(
+                            start: ptr.baseAddress, count: toWrite
+                        ))
+                    }
+                }
 
                 // Write to file
                 let written = buffer.withUnsafeBytes { ptr in
@@ -192,6 +209,11 @@ final class OverwriteShredder {
                 await Task.yield()
             }
 
+            // Finalize hash for this pass
+            if trackHash, let h = hasher {
+                writtenRandomHash = h.finalize()
+            }
+
             // Flush after each pass to ensure data reaches disk
             fsync(fd)
             _ = fcntl(fd, F_FULLFSYNC)
@@ -199,7 +221,14 @@ final class OverwriteShredder {
 
         // Verification: read back final pass and check pattern
         if verify {
-            try verifyFinalPass(fd: fd, fileSize: fileSize, pattern: lastPattern, buffer: &buffer, url: url)
+            try verifyFinalPass(
+                fd: fd,
+                fileSize: fileSize,
+                pattern: lastPattern,
+                buffer: &buffer,
+                url: url,
+                expectedRandomHash: writtenRandomHash
+            )
         }
 
         // Zero the buffer before deallocation
@@ -229,21 +258,26 @@ final class OverwriteShredder {
         }
     }
 
-    /// Verify the final pass by reading data back and checking it matches the expected pattern
+    /// Verify the final pass by reading data back and checking it matches the expected pattern.
+    /// For zeros/ones passes: byte-by-byte comparison against the expected value.
+    /// For random passes: SHA-256 hash comparison against the hash computed during writing.
     private func verifyFinalPass(
         fd: Int32,
         fileSize: Int64,
         pattern: DoDPattern,
         buffer: inout [UInt8],
-        url: URL
+        url: URL,
+        expectedRandomHash: SHA256Digest?
     ) throws {
-        // Random data can't be verified by pattern; just confirm bytes were written (non-zero check)
         guard lseek(fd, 0, SEEK_SET) == 0 else {
             throw ShredError.verificationFailed(url)
         }
 
         var remaining = fileSize
         let bufSize = buffer.count
+
+        // For random verification, compute a running hash of read-back data
+        var readHasher: SHA256? = (pattern == .random && expectedRandomHash != nil) ? SHA256() : nil
 
         while remaining > 0 {
             let toRead = Int(min(Int64(bufSize), remaining))
@@ -269,28 +303,34 @@ final class OverwriteShredder {
                     }
                 }
             case .random:
-                // For random data we can't verify the exact pattern, but we verify
-                // that data was actually written (not all zeros which might indicate I/O failure)
-                var allZero = true
-                for i in 0..<min(toRead, 512) {
-                    if buffer[i] != 0 {
-                        allZero = false
-                        break
+                // Feed read-back data into hash for comparison
+                if readHasher != nil {
+                    buffer.withUnsafeBufferPointer { ptr in
+                        readHasher!.update(bufferPointer: UnsafeRawBufferPointer(
+                            start: ptr.baseAddress, count: toRead
+                        ))
                     }
-                }
-                if allZero && toRead > 0 {
-                    throw ShredError.verificationFailed(url)
                 }
             }
 
             remaining -= Int64(bytesRead)
+        }
+
+        // For random pass: compare the hash of what was written vs what was read back
+        if pattern == .random, let expectedHash = expectedRandomHash, let hasher = readHasher {
+            let readHash = hasher.finalize()
+            // Compare digests byte-by-byte
+            let expected = Array(expectedHash)
+            let actual = Array(readHash)
+            if expected != actual {
+                throw ShredError.verificationFailed(url)
+            }
         }
     }
 
     /// Zero buffer contents using memset_s to prevent compiler optimization from eliding the zeroing
     private func zeroBuffer(_ buffer: inout [UInt8]) {
         buffer.withUnsafeMutableBytes { ptr in
-            // memset_s is guaranteed not to be optimized away
             _ = memset_s(ptr.baseAddress!, ptr.count, 0, ptr.count)
         }
     }
